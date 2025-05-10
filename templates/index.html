@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rosas dos Ventos- Junior Borges</title>
+  <style>
+    body {
+      margin: 0;
+      background: #121212;
+      font-family: 'Segoe UI', sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+    }
+
+    .compass-container {
+      position: relative;
+      width: 340px;
+      height: 340px;
+      background: radial-gradient(circle at center, #1f1f1f 60%, #0d0d0d);
+      border-radius: 50%;
+      border: 4px double #00e5ff;
+      box-shadow: 0 0 25px rgba(0, 229, 255, 0.3);
+    }
+
+    .direction {
+      position: absolute;
+      font-weight: 600;
+      font-size: 22px;
+      color: #777;
+      transition: all 0.3s ease-in-out;
+    }
+
+    .direction.active {
+      color: #00e5ff;
+      text-shadow: 0 0 12px rgba(0, 229, 255, 0.9);
+      transform: scale(1.35);
+    }
+
+    .north     { top: 10px; left: 50%; transform: translateX(-50%); }
+    .south     { bottom: 10px; left: 50%; transform: translateX(-50%); }
+    .east      { right: 10px; top: 50%; transform: translateY(-50%); }
+    .west      { left: 10px; top: 50%; transform: translateY(-50%); }
+
+    .northeast { top: 20px; right: 20px; }
+    .northwest { top: 20px; left: 20px; }
+    .southeast { bottom: 20px; right: 20px; }
+    .southwest { bottom: 20px; left: 20px; }
+
+    .center-dot {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 20px;
+      height: 20px;
+      background: #00e5ff;
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 0 10px rgba(0, 229, 255, 0.7);
+    }
+
+    .center-dot.active {
+      background: #ff4081;
+      box-shadow: 0 0 15px rgba(255, 64, 129, 0.8);
+    }
+
+    .status {
+      position: absolute;
+      top: 100%;
+      margin-top: 20px;
+      width: 100%;
+      text-align: center;
+      font-size: 18px;
+      color: #cccccc;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="compass-container">
+    <div class="center-dot" id="center-dot"></div>
+
+    <div class="direction north" id="north">N</div>
+    <div class="direction south" id="south">S</div>
+    <div class="direction east" id="east">L</div>
+    <div class="direction west" id="west">O</div>
+
+    <div class="direction northeast" id="northeast">NE</div>
+    <div class="direction northwest" id="northwest">NO</div>
+    <div class="direction southeast" id="southeast">SE</div>
+    <div class="direction southwest" id="southwest">SO</div>
+
+    <div class="status" id="status">Aguardando direção...</div>
+  </div>
+
+  <!-- Socket.IO Client -->
+  <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+  <script>
+    const directions = {
+      'Norte': document.getElementById('north'),
+      'Sul': document.getElementById('south'),
+      'Leste': document.getElementById('east'),
+      'Oeste': document.getElementById('west'),
+      'Nordeste': document.getElementById('northeast'),
+      'Noroeste': document.getElementById('northwest'),
+      'Sudeste': document.getElementById('southeast'),
+      'Sudoeste': document.getElementById('southwest'),
+      'Centro': null
+    };
+
+    const centerDot = document.getElementById('center-dot');
+    const status = document.getElementById('status');
+
+    const socket = io('http://' + window.location.hostname + ':5000');
+
+    socket.on('nova_direcao', (direction) => {
+      Object.values(directions).forEach(el => el?.classList.remove('active'));
+      centerDot.classList.remove('active');
+
+      if (directions[direction]) {
+        directions[direction].classList.add('active');
+        status.textContent = `Direção: ${direction}`;
+      } else if (direction === 'Centro') {
+        centerDot.classList.add('active');
+        status.textContent = 'Posição central';
+      }
+    });
+
+    socket.on('connect_error', () => {
+      status.textContent = 'Erro ao conectar ao servidor Socket.IO';
+    });
+  </script>
+
+</body>
+</html>

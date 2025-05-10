@@ -1,0 +1,444 @@
+/*
+ * Cliente HTTP para Raspberry Pi Pico W
+ * Versão aprimorada com tratamento de botões e direções
+ */
+#include <stdio.h>
+#include <string.h>
+#include "pico/stdio.h"
+#include "pico/cyw43_arch.h"
+#include "pico/async_context.h"
+#include "lwip/altcp_tls.h"
+#include "example_http_client_util.h"
+#include "hardware/adc.h"
+#include "hardware/pwm.h"
+#include "math.h"
+
+// Configurações de rede
+#define HOST "172.20.10.2"
+#define PORT 5000
+#define INTERVALO_MS 50
+#define TIMEOUT_CONEXAO 30000
+
+// Definições de pinos
+#define BUTTON_A 5
+#define SENSOR_INFRA 3
+#define LED_AZUL 12
+#define LED_VERDE 11
+#define LED_VERMELHO 13
+#define CENTER_VALUE 2048  // Valor médio do ADC para joysticks de 12 bits
+
+// Pinos do joystick
+const int JOYSTICK_X = 26;
+const int JOYSTICK_Y = 27;
+const int BOTAO_JOYSTICK = 22;
+const int ADC_CANAL_X = 0;
+const int ADC_CANAL_Y = 1;
+
+// Estrutura para cores RGB
+typedef struct {
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+    const char* nome;
+} CorDirecao;
+
+// Paleta de cores melhorada
+const CorDirecao cores_direcoes[] = {
+    {255, 0, 0,     "Norte"},      // Vermelho (cor quente para cima)
+    {0, 0, 255,     "Sul"},        // Azul (cor fria para baixo)
+    {0, 255, 0,     "Leste"},      // Verde (cor vibrante e ativa)
+    {255, 255, 0,   "Oeste"},      // Amarelo (forte e claro)
+    {255, 105, 180, "Nordeste"},   // Rosa (destaque suave)
+    {255, 140, 0,   "Noroeste"},   // Laranja escuro (visual marcante)
+    {0, 255, 255,   "Sudeste"},    // Ciano (fresco e moderno)
+    {138, 43, 226,  "Sudoeste"},   // Azul violeta (forte e diferente)
+    {0, 0, 0,       "Centro"}      // Preto (indicando neutralidade)
+};
+
+
+// Estrutura para botões
+typedef struct {
+    uint gpio;
+    const char* mensagem;
+} Botao;
+
+const Botao botoes[] = {
+    {BUTTON_A, "BUTTON_A"},
+    {SENSOR_INFRA, "SENSOR_INFRA"}
+};
+
+void configurar_joystick() {
+    adc_init();
+    adc_gpio_init(JOYSTICK_Y);
+    adc_gpio_init(JOYSTICK_X);
+    gpio_init(BOTAO_JOYSTICK);
+    gpio_set_dir(BOTAO_JOYSTICK, GPIO_IN);
+    gpio_pull_up(BOTAO_JOYSTICK);
+}
+
+void configurar_leds() {
+    gpio_init(LED_AZUL);
+    gpio_set_dir(LED_AZUL, GPIO_OUT);
+    gpio_init(LED_VERDE);
+    gpio_set_dir(LED_VERDE, GPIO_OUT);
+    gpio_init(LED_VERMELHO);
+    gpio_set_dir(LED_VERMELHO, GPIO_OUT);
+}
+
+void configurar_botoes() {
+    for (size_t i = 0; i < sizeof(botoes)/sizeof(botoes[0]); i++) {
+        gpio_init(botoes[i].gpio);
+        gpio_set_dir(botoes[i].gpio, GPIO_IN);
+        gpio_pull_up(botoes[i].gpio);
+    }
+}
+
+void inicializar_pwm() {
+    gpio_set_function(LED_VERMELHO, GPIO_FUNC_PWM);
+    gpio_set_function(LED_VERDE, GPIO_FUNC_PWM);
+    gpio_set_function(LED_AZUL, GPIO_FUNC_PWM);
+    
+    pwm_config config = pwm_get_default_config();
+    pwm_config_set_clkdiv(&config, 4.f);
+    pwm_config_set_wrap(&config, 255);
+    
+    pwm_init(pwm_gpio_to_slice_num(LED_VERMELHO), &config, true);
+    pwm_init(pwm_gpio_to_slice_num(LED_VERDE), &config, true);
+    pwm_init(pwm_gpio_to_slice_num(LED_AZUL), &config, true);
+}
+
+void acender_led_rgb(uint8_t r, uint8_t g, uint8_t b) {
+    pwm_set_gpio_level(LED_VERMELHO, r * r / 255);
+    pwm_set_gpio_level(LED_VERDE, g * g / 255);
+    pwm_set_gpio_level(LED_AZUL, b * b / 255);
+}
+
+void acender_led_por_direcao(const char* direcao) {
+    for (size_t i = 0; i < sizeof(cores_direcoes)/sizeof(cores_direcoes[0]); i++) {
+        if (strstr(direcao, cores_direcoes[i].nome)) {
+            acender_led_rgb(cores_direcoes[i].r, cores_direcoes[i].g, cores_direcoes[i].b);
+            return;
+        }
+    }
+    acender_led_rgb(0, 0, 0);
+}
+
+void ler_eixos_joystick(uint16_t *x, uint16_t *y) {
+    adc_select_input(ADC_CANAL_X);
+    *x = adc_read();
+    adc_select_input(ADC_CANAL_Y);
+    *y = adc_read();
+}
+
+// Converte radianos para graus
+float rad_para_graus(float rad) {
+    return rad * (180.0f / M_PI);
+}
+
+// Função de calibração que calcula os ângulos do joystick
+void calibrar_joystick(uint16_t *min_x, uint16_t *max_x, uint16_t *min_y, uint16_t *max_y) {
+    sleep_ms(3000); // Tempo para ler a mensagem no serial monitor
+    gpio_put(LED_VERDE, 1); // Acende LED verde durante calibração
+    printf("Calibrando joystick... Mova o eixo em todas as direções durante 4 segundos\n");
+
+    uint32_t inicio = to_ms_since_boot(get_absolute_time());
+    while (to_ms_since_boot(get_absolute_time()) - inicio < 4000) {
+        uint16_t x, y;
+        ler_eixos_joystick(&x, &y);
+
+        *min_x = x < *min_x ? x : *min_x;
+        *max_x = x > *max_x ? x : *max_x;
+        *min_y = y < *min_y ? y : *min_y;
+        *max_y = y > *max_y ? y : *max_y;
+
+        sleep_ms(10);
+    }
+
+    printf("Calibração finalizada:\n");
+    printf("X: min=%d, max=%d\n", *min_x, *max_x);
+    printf("Y: min=%d, max=%d\n", *min_y, *max_y);
+
+    gpio_put(LED_VERDE, 0); // Desliga LED verde após calibração
+    sleep_ms(2000); // Tempo para ler a calibração
+}
+
+// Calcula ângulo do joystick baseado nos valores calibrados
+float calcular_angulo_joystick(uint16_t x, uint16_t y, uint16_t min_x, uint16_t max_x, uint16_t min_y, uint16_t max_y) {
+    // Normaliza valores para o centro do eixo (de -1 a 1)
+    float centro_x = (max_x + min_x) / 2.0f;
+    float centro_y = (max_y + min_y) / 2.0f;
+
+    float norm_x = (float)(x - centro_x) / ((max_x - min_x) / 2.0f);
+    float norm_y = (float)(y - centro_y) / ((max_y - min_y) / 2.0f);
+
+    float angulo_rad = atan2f(-norm_y, norm_x); // Inverte Y para convenção "cima = 0°"
+    float angulo_graus = rad_para_graus(angulo_rad);
+
+    // Ajusta para ficar entre 0 e 360
+    if (angulo_graus < 0) angulo_graus += 360.0f;
+
+    return angulo_graus;
+}
+int conectar_wifi() {
+    printf("Conectando a %s...\n", WIFI_SSID);
+    int resultado = cyw43_arch_wifi_connect_timeout_ms(
+        WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, TIMEOUT_CONEXAO);
+    
+    if (resultado != 0) {
+        printf("Falha na conexão Wi-Fi. Código: %d\n", resultado);
+        return -1;
+    }
+    
+    printf("Conectado! IP: %s\n", ip4addr_ntoa(netif_ip4_addr(netif_list)));
+    return 0;
+}
+
+int enviar_mensagem_http(const char *url) {
+    EXAMPLE_HTTP_REQUEST_T req = {
+        .hostname = HOST,
+        .url = url,
+        .port = PORT,
+        .headers_fn = http_client_header_print_fn,
+        .recv_fn = http_client_receive_print_fn
+    };
+    
+    printf("Enviando: %s\n", url);
+    int resultado = http_client_request_sync(cyw43_arch_async_context(), &req);
+    
+    if (resultado != 0) {
+        printf("Erro HTTP: %d\n", resultado);
+    }
+    
+    return resultado;
+}
+
+void processar_direcao(int eixo_x_norm, int eixo_y_norm, char *url) {
+    if (eixo_y_norm < 40) { // Cima
+        if (eixo_x_norm < 40) {
+            sprintf(url, "/mensagem?msg=Sudoeste");
+        } else if (eixo_x_norm > 60) {
+            sprintf(url, "/mensagem?msg=Noroeste");
+        } else {
+            sprintf(url, "/mensagem?msg=Oeste");
+        }
+    } else if (eixo_y_norm > 60) { // Baixo
+        if (eixo_x_norm < 40) {
+            sprintf(url, "/mensagem?msg=Sudeste");
+        } else if (eixo_x_norm > 60) {
+            sprintf(url, "/mensagem?msg=Nordeste");
+        } else {
+            sprintf(url, "/mensagem?msg=Leste");
+        }
+    } else { // Centro vertical
+        if (eixo_x_norm < 40) {
+            sprintf(url, "/mensagem?msg=Sul");
+        } else if (eixo_x_norm > 60) {
+            sprintf(url, "/mensagem?msg=Norte");
+        } else {
+            sprintf(url, "/mensagem?msg=Centro");
+        }
+    }
+    
+    acender_led_por_direcao(url);
+}
+
+void verificar_botoes(char *url) {
+    for (size_t i = 0; i < sizeof(botoes)/sizeof(botoes[0]); i++) {
+        if (gpio_get(botoes[i].gpio) == 0) {
+            sprintf(url, "/mensagem?msg=%s", botoes[i].mensagem);
+            return;
+        }
+    }
+}
+
+int main() {
+    stdio_init_all();
+    printf("\nIniciando cliente HTTP aprimorado...\n");
+
+    // Inicialização do hardware
+    configurar_leds();
+    configurar_joystick();
+    configurar_botoes();
+    inicializar_pwm();
+
+    // Calibração do joystick
+    uint16_t min_x = 4095, max_x = 0;
+    uint16_t min_y = 4095, max_y = 0;
+    calibrar_joystick(&min_x, &max_x, &min_y, &max_y);
+
+    // Inicialização Wi-Fi
+    if (cyw43_arch_init()) {
+        printf("Erro ao inicializar Wi-Fi\n");
+        return 1;
+    }
+    cyw43_arch_enable_sta_mode();
+
+    if (conectar_wifi() != 0) {
+        return 1;
+    }
+
+    // Loop principal
+    char url[128];
+    uint16_t valor_x, valor_y;
+    
+    while (true) {
+        // Ler e normalizar valores do joystick
+        ler_eixos_joystick(&valor_x, &valor_y);
+        int eixo_x_norm = (valor_x - min_x) * 100 / (max_x - min_x);
+        int eixo_y_norm = (valor_y - min_y) * 100 / (max_y - min_y);
+
+        // Processar direção (define a URL padrão)
+        processar_direcao(eixo_x_norm, eixo_y_norm, url);
+
+        // Verificar botões (sobrescreve a URL se pressionado)
+        verificar_botoes(url);
+
+        // Enviar mensagem HTTP
+        if (enviar_mensagem_http(url) != 0) {
+            // Tentar reconectar em caso de erro
+            cyw43_arch_wifi_connect_timeout_ms(
+                WIFI_SSID, WIFI_PASSWORD, CYW43_AUTH_WPA2_AES_PSK, 10000);
+        }
+
+        printf("X: %d (%d%%), Y: %d (%d%%)\n", 
+               valor_x, eixo_x_norm, valor_y, eixo_y_norm);
+
+        sleep_ms(INTERVALO_MS);
+    }
+} <!DOCTYPE html>
+<html lang="pt-br">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Rosas dos Ventos- Junior Borges</title>
+  <style>
+    body {
+      margin: 0;
+      background: #121212;
+      font-family: 'Segoe UI', sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+    }
+
+    .compass-container {
+      position: relative;
+      width: 340px;
+      height: 340px;
+      background: radial-gradient(circle at center, #1f1f1f 60%, #0d0d0d);
+      border-radius: 50%;
+      border: 4px double #00e5ff;
+      box-shadow: 0 0 25px rgba(0, 229, 255, 0.3);
+    }
+
+    .direction {
+      position: absolute;
+      font-weight: 600;
+      font-size: 22px;
+      color: #777;
+      transition: all 0.3s ease-in-out;
+    }
+
+    .direction.active {
+      color: #00e5ff;
+      text-shadow: 0 0 12px rgba(0, 229, 255, 0.9);
+      transform: scale(1.35);
+    }
+
+    .north     { top: 10px; left: 50%; transform: translateX(-50%); }
+    .south     { bottom: 10px; left: 50%; transform: translateX(-50%); }
+    .east      { right: 10px; top: 50%; transform: translateY(-50%); }
+    .west      { left: 10px; top: 50%; transform: translateY(-50%); }
+
+    .northeast { top: 20px; right: 20px; }
+    .northwest { top: 20px; left: 20px; }
+    .southeast { bottom: 20px; right: 20px; }
+    .southwest { bottom: 20px; left: 20px; }
+
+    .center-dot {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 20px;
+      height: 20px;
+      background: #00e5ff;
+      border-radius: 50%;
+      transform: translate(-50%, -50%);
+      box-shadow: 0 0 10px rgba(0, 229, 255, 0.7);
+    }
+
+    .center-dot.active {
+      background: #ff4081;
+      box-shadow: 0 0 15px rgba(255, 64, 129, 0.8);
+    }
+
+    .status {
+      position: absolute;
+      top: 100%;
+      margin-top: 20px;
+      width: 100%;
+      text-align: center;
+      font-size: 18px;
+      color: #cccccc;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="compass-container">
+    <div class="center-dot" id="center-dot"></div>
+
+    <div class="direction north" id="north">N</div>
+    <div class="direction south" id="south">S</div>
+    <div class="direction east" id="east">L</div>
+    <div class="direction west" id="west">O</div>
+
+    <div class="direction northeast" id="northeast">NE</div>
+    <div class="direction northwest" id="northwest">NO</div>
+    <div class="direction southeast" id="southeast">SE</div>
+    <div class="direction southwest" id="southwest">SO</div>
+
+    <div class="status" id="status">Aguardando direção...</div>
+  </div>
+
+  <!-- Socket.IO Client -->
+  <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+  <script>
+    const directions = {
+      'Norte': document.getElementById('north'),
+      'Sul': document.getElementById('south'),
+      'Leste': document.getElementById('east'),
+      'Oeste': document.getElementById('west'),
+      'Nordeste': document.getElementById('northeast'),
+      'Noroeste': document.getElementById('northwest'),
+      'Sudeste': document.getElementById('southeast'),
+      'Sudoeste': document.getElementById('southwest'),
+      'Centro': null
+    };
+
+    const centerDot = document.getElementById('center-dot');
+    const status = document.getElementById('status');
+
+    const socket = io('http://' + window.location.hostname + ':5000');
+
+    socket.on('nova_direcao', (direction) => {
+      Object.values(directions).forEach(el => el?.classList.remove('active'));
+      centerDot.classList.remove('active');
+
+      if (directions[direction]) {
+        directions[direction].classList.add('active');
+        status.textContent = `Direção: ${direction}`;
+      } else if (direction === 'Centro') {
+        centerDot.classList.add('active');
+        status.textContent = 'Posição central';
+      }
+    });
+
+    socket.on('connect_error', () => {
+      status.textContent = 'Erro ao conectar ao servidor Socket.IO';
+    });
+  </script>
+
+</body>
+</html>
